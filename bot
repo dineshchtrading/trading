@@ -1,0 +1,560 @@
+import math
+import random
+import os
+import csv
+import json
+import webbrowser
+import urllib.parse
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# =====================================================================
+# 1. FYERS API V3 AUTHENTICATION & DATA CONNECTOR
+# =====================================================================
+
+TOKEN_CACHE_FILE = Path(__file__).resolve().parent / ".fyers_token"
+
+def extract_auth_code(input_str: str) -> str:
+    """Extract auth_code whether the user pasted a raw code or full redirected URL."""
+    input_str = input_str.strip()
+    if not input_str:
+        return ""
+    if "auth_code=" in input_str:
+        parsed = urllib.parse.urlparse(input_str)
+        params = urllib.parse.parse_qs(parsed.query)
+        if "auth_code" in params:
+            return params["auth_code"][0]
+    if "code=" in input_str:
+        parsed = urllib.parse.urlparse(input_str)
+        params = urllib.parse.parse_qs(parsed.query)
+        if "code" in params:
+            return params["code"][0]
+    return input_str
+
+def authenticate_fyers(client_id: str, secret_key: str, redirect_uri: str = "https://trade.fyers.in/api-login/redirect-uri-result.html") -> str:
+    """
+    Performs interactive OAuth authentication to generate a valid FYERS API v3 access token.
+    """
+    from fyers_apiv3 import fyersModel
+
+    session = fyersModel.SessionModel(
+        client_id=client_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+        response_type="code",
+        grant_type="authorization_code"
+    )
+
+    auth_url = session.generate_authcode()
+    print("\n" + "=" * 65)
+    print("                FYERS API v3 AUTHENTICATION")
+    print("=" * 65)
+    print("Please open this link in your browser to log in:")
+    print(auth_url)
+    print("-" * 65)
+
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+
+    user_input = input("Paste the redirected URL or auth_code here: ").strip()
+    auth_code = extract_auth_code(user_input)
+
+    if not auth_code:
+        raise ValueError("Invalid or empty auth code provided.")
+
+    session.set_token(auth_code)
+    response = session.generate_token()
+
+    if isinstance(response, dict) and response.get("s") == "ok":
+        access_token = response.get("access_token")
+        # Cache token locally
+        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write(access_token)
+        print("[+] Authentication Successful! Access token cached locally.")
+        return access_token
+    else:
+        raise RuntimeError(f"Failed to generate access token: {response}")
+
+def get_cached_access_token() -> str:
+    """Retrieves cached access token if available."""
+    if TOKEN_CACHE_FILE.exists():
+        try:
+            with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+    return ""
+
+
+class FyersDataConnector:
+    """
+    Connects to FYERS API v3 to pull historical OHLCV data for backtesting.
+    Requires: pip install fyers-apiv3
+    """
+    def __init__(self, client_id=None, access_token=None):
+        self.client_id = client_id
+        self.access_token = access_token
+        self.fyers = None
+        
+        if client_id and access_token:
+            from fyers_apiv3 import fyersModel
+            self.fyers = fyersModel.FyersModel(
+                client_id=self.client_id, 
+                is_async=False, 
+                token=self.access_token, 
+                log_path=""
+            )
+
+    def fetch_historical_candles(self, symbol="NSE:SBIN-EQ", resolution="15", days_back=30):
+        """Fetches candles from FYERS. Falls back to synthetic candles if no API keys are provided."""
+        if self.fyers:
+            now = datetime.now()
+            start_date = now - timedelta(days=days_back)
+            
+            # FYERS limits intraday historical data requests to chunks of ~90-100 days
+            chunk_days = 90 if resolution != "D" else 360
+            curr_start = start_date
+            all_candles = []
+            
+            print(f"[*] Fetching {symbol} [{resolution}] from FYERS API ({days_back} days back)...")
+            
+            while curr_start < now:
+                curr_end = min(curr_start + timedelta(days=chunk_days), now)
+                
+                # FYERS expects YYYY-MM-DD date strings when date_format="1"
+                range_from = curr_start.strftime("%Y-%m-%d")
+                range_to = curr_end.strftime("%Y-%m-%d")
+                
+                data = {
+                    "symbol": symbol,
+                    "resolution": resolution,
+                    "date_format": "1",
+                    "range_from": range_from,
+                    "range_to": range_to,
+                    "cont_flag": "1"
+                }
+                
+                try:
+                    response = self.fyers.history(data=data)
+                    if isinstance(response, dict) and response.get("s") == "ok":
+                        candles = response.get("candles", [])
+                        all_candles.extend(candles)
+                    else:
+                        msg = response.get("message", "Failed to fetch history") if isinstance(response, dict) else str(response)
+                        print(f"[FYERS API Warning]: {msg}")
+                except Exception as e:
+                    print(f"[FYERS API Exception]: {e}")
+                
+                curr_start = curr_end + timedelta(days=1)
+            
+            if all_candles:
+                # Deduplicate candles by epoch timestamp
+                seen_epochs = set()
+                unique_candles = []
+                for c in all_candles:
+                    if c[0] not in seen_epochs:
+                        seen_epochs.add(c[0])
+                        unique_candles.append(c)
+                unique_candles.sort(key=lambda x: x[0])
+                print(f"[+] Successfully fetched {len(unique_candles)} live candles from FYERS API.")
+                return unique_candles
+
+        # Fallback synthetic candle generator for offline testing
+        print("[!] Using fallback synthetic candle generator (no live API connection or empty response).")
+        return self._generate_synthetic_fyers_data(num_candles=120)
+
+    def _generate_synthetic_fyers_data(self, num_candles=120):
+        candles = []
+        base_price = 500.0
+        curr_time = int(datetime.now().timestamp()) - (num_candles * 900)
+        
+        random.seed(42)
+        for i in range(num_candles):
+            drift = 1.2 if 20 <= i <= 60 else (-1.0 if 60 < i <= 90 else 0.1)
+            change = drift + random.uniform(-2.5, 2.5)
+            base_price = max(10.0, base_price + change)
+            
+            open_p = base_price - random.uniform(-0.5, 0.5)
+            high_p = max(open_p, base_price) + random.uniform(0.5, 2.5)
+            low_p = min(open_p, base_price) - random.uniform(0.5, 2.5)
+            close_p = base_price
+            vol = int(random.uniform(10000, 50000) * (2.0 if abs(change) > 1.5 else 1.0))
+            
+            candles.append([curr_time + (i * 900), open_p, high_p, low_p, close_p, vol])
+        return candles
+
+
+# =====================================================================
+# 2. QUANT MATHEMATICS & INDICATOR CALCULATOR
+# =====================================================================
+
+def calculate_ema(series, period):
+    if len(series) < period:
+        return [0.0] * len(series)
+    k = 2.0 / (period + 1)
+    sma = sum(series[:period]) / period
+    ema = [0.0] * (period - 1) + [sma]
+    for val in series[period:]:
+        ema.append((val * k) + (ema[-1] * (1.0 - k)))
+    return ema
+
+def calculate_macd(closes, fast_p=12, slow_p=26, signal_p=9):
+    if len(closes) < slow_p + signal_p:
+        return 0.0, 0.0, 0.0
+    ema_fast = calculate_ema(closes, fast_p)
+    ema_slow = calculate_ema(closes, slow_p)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    valid_macd = macd_line[slow_p - 1:]
+    signal_line = [0.0] * (slow_p - 1) + calculate_ema(valid_macd, signal_p)
+    
+    return macd_line[-1], signal_line[-1], macd_line[-1] - signal_line[-1]
+
+def calculate_rsi(closes, period=14):
+    if len(closes) <= period:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(diff if diff > 0 else 0.0)
+        losses.append(abs(diff) if diff < 0 else 0.0)
+        
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+        
+    if avg_l == 0: return 100.0
+    return 100.0 - (100.0 / (1.0 + (avg_g / avg_l)))
+
+def calculate_atr(highs, lows, closes, period=14):
+    if len(closes) < period + 1:
+        return 1.0
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) 
+           for i in range(1, len(closes))]
+    return calculate_ema(trs, period)[-1]
+
+
+# =====================================================================
+# 3. THREE DISTINCT QUANT RISK ENGINES
+# =====================================================================
+
+class DefensiveRiskEngine:
+    """
+    ENGINE 1: High Volatility / Bearish Regime
+    Focus: Capital preservation, tight ATR stops, fractional Kelly reduction.
+    """
+    def __init__(self, risk_fraction=0.005, atr_mult=1.8, kelly_frac=0.25):
+        self.risk_fraction = risk_fraction  # 0.5% risk
+        self.atr_mult = atr_mult            # Tight 1.8x ATR trailing stop
+        self.kelly_frac = kelly_frac
+
+    def get_position_params(self, capital, price, atr, win_rate=0.48, win_loss_ratio=1.5):
+        # Fractional Kelly sizing adjustment
+        b = win_loss_ratio
+        p = win_rate
+        kelly_f = max(0.01, (p * b - (1 - p)) / b) * self.kelly_frac
+        
+        dollar_risk = capital * min(self.risk_fraction, kelly_f)
+        stop_dist = max(0.5, atr * self.atr_mult)
+        units = int(dollar_risk / stop_dist)
+        return max(1, units), stop_dist, "DEFENSIVE (Tight Stop & Quarter Kelly)"
+
+
+class StandardRiskEngine:
+    """
+    ENGINE 2: Normal Volatility / Ranging Regime
+    Focus: Balanced 1% risk per trade with standard 2.5x ATR trailing stop.
+    """
+    def __init__(self, risk_fraction=0.010, atr_mult=2.5):
+        self.risk_fraction = risk_fraction  # 1.0% risk
+        self.atr_mult = atr_mult            # Standard 2.5x ATR trailing stop
+
+    def get_position_params(self, capital, price, atr, win_rate=0.52, win_loss_ratio=2.0):
+        dollar_risk = capital * self.risk_fraction
+        stop_dist = max(0.5, atr * self.atr_mult)
+        units = int(dollar_risk / stop_dist)
+        return max(1, units), stop_dist, "STANDARD (Fixed 1% Risk & 2.5x ATR)"
+
+
+class AggressiveRiskEngine:
+    """
+    ENGINE 3: Low Volatility / Strong Trend Expansion Regime
+    Focus: Maximizes returns during strong trends with wider stops & higher risk.
+    """
+    def __init__(self, risk_fraction=0.020, atr_mult=3.5):
+        self.risk_fraction = risk_fraction  # 2.0% risk
+        self.atr_mult = atr_mult            # Wide 3.5x ATR to avoid early exit
+
+    def get_position_params(self, capital, price, atr, win_rate=0.55, win_loss_ratio=2.5):
+        dollar_risk = capital * self.risk_fraction
+        stop_dist = max(0.5, atr * self.atr_mult)
+        units = int(dollar_risk / stop_dist)
+        return max(1, units), stop_dist, "AGGRESSIVE (Expanded 2% Risk & Wide 3.5x ATR)"
+
+
+# =====================================================================
+# 4. REGIME-AWARE RISK SELECTOR ENGINE
+# =====================================================================
+
+class AdaptiveRegimeRiskManager:
+    """
+    Evaluates market condition (ATR % relative to price) and routes 
+    orders to the appropriate Risk Engine dynamically.
+    """
+    def __init__(self):
+        self.defensive_engine = DefensiveRiskEngine()
+        self.standard_engine = StandardRiskEngine()
+        self.aggressive_engine = AggressiveRiskEngine()
+
+    def select_engine_and_size(self, capital, price, atr, rsi):
+        atr_pct = (atr / price) * 100.0 if price > 0 else 0.0
+
+        # Regime 1: Extreme Volatility (ATR > 2.5%) -> Defensive Engine
+        if atr_pct > 2.5:
+            units, stop_dist, name = self.defensive_engine.get_position_params(capital, price, atr)
+            return units, stop_dist, name, "HIGH_VOLATILITY"
+
+        # Regime 2: Low Volatility & Strong Trend (ATR < 1.2% & RSI > 52) -> Aggressive Engine
+        elif atr_pct < 1.2 and rsi > 52.0:
+            units, stop_dist, name = self.aggressive_engine.get_position_params(capital, price, atr)
+            return units, stop_dist, name, "TREND_EXPANSION"
+
+        # Regime 3: Normal Conditions -> Standard Engine
+        else:
+            units, stop_dist, name = self.standard_engine.get_position_params(capital, price, atr)
+            return units, stop_dist, name, "NORMAL_MARKET"
+
+
+# =====================================================================
+# 5. BACKTEST ENGINE & LOCAL TRADE SAVING
+# =====================================================================
+
+def save_trades_to_csv(trades_log, output_path="trades_data.csv"):
+    """Saves all backtested trade records to a local CSV file."""
+    if not trades_log:
+        print("[!] No trades were executed during this backtest run.")
+        return
+
+    fieldnames = [
+        "trade_id", "entry_bar", "entry_time", "entry_price", "units",
+        "regime", "risk_engine", "exit_bar", "exit_time", "exit_price",
+        "exit_reason", "pnl", "pnl_pct", "balance"
+    ]
+    
+    with open(output_path, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(trades_log)
+
+    print(f"\n[+] All {len(trades_log)} trades successfully saved locally to: {output_path}")
+
+def format_candle_time(epoch_val):
+    """Format candle timestamp to readable datetime string."""
+    try:
+        return datetime.fromtimestamp(epoch_val).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(epoch_val)
+
+def run_fyers_backtest(client_id=None, access_token=None, symbol="NSE:SBIN-EQ", resolution="15", days_back=30, output_csv="trades_data.csv"):
+    # Initialize Data Connector and Risk Manager
+    fyers_connector = FyersDataConnector(client_id, access_token)
+    risk_manager = AdaptiveRegimeRiskManager()
+    
+    candles = fyers_connector.fetch_historical_candles(symbol=symbol, resolution=resolution, days_back=days_back)
+    print(f"Loaded {len(candles)} candles for backtest execution.\n")
+    
+    initial_capital = 100000.0
+    capital = initial_capital
+    highs, lows, closes, volumes = [], [], [], []
+    
+    position = None # "LONG" or None
+    units = 0
+    entry_price = 0.0
+    stop_loss = 0.0
+    highest_price = 0.0
+    
+    # Trade logging structure
+    trades_log = []
+    current_trade = None
+    
+    print("=" * 95)
+    print(f"{'BAR':<5} | {'TIME':<19} | {'CLOSE':<8} | {'REGIME':<15} | {'RISK ENGINE':<32} | {'ACTION / STATUS'}")
+    print("=" * 95)
+    
+    for idx, c in enumerate(candles):
+        # FYERS candle unpacking: [ts, open, high, low, close, volume]
+        ts, open_p, high_p, low_p, close_p, vol = c
+        candle_time_str = format_candle_time(ts)
+        
+        highs.append(high_p)
+        lows.append(low_p)
+        closes.append(close_p)
+        volumes.append(vol)
+        
+        if len(closes) < 30:
+            continue
+            
+        macd, signal, hist = calculate_macd(closes)
+        rsi = calculate_rsi(closes)
+        atr = calculate_atr(highs, lows, closes)
+        
+        # Route to appropriate Risk Engine
+        req_units, stop_dist, engine_name, regime = risk_manager.select_engine_and_size(capital, close_p, atr, rsi)
+        
+        # --- POSITION MANAGEMENT (In a Trade) ---
+        if position == "LONG":
+            highest_price = max(highest_price, high_p)
+            stop_loss = max(stop_loss, highest_price - stop_dist) # ATR Trailing Stop Ratchet
+            
+            if low_p <= stop_loss:
+                pnl = (stop_loss - entry_price) * units
+                capital += pnl
+                pnl_pct = ((stop_loss - entry_price) / entry_price) * 100.0
+                status = f"EXIT LONG @ Rs.{stop_loss:.2f} (PnL: Rs.{pnl:+.2f})"
+                
+                # Log closed trade
+                if current_trade:
+                    current_trade["exit_bar"] = idx
+                    current_trade["exit_time"] = candle_time_str
+                    current_trade["exit_price"] = round(stop_loss, 2)
+                    current_trade["exit_reason"] = "TRAILING_STOP_HIT"
+                    current_trade["pnl"] = round(pnl, 2)
+                    current_trade["pnl_pct"] = round(pnl_pct, 2)
+                    current_trade["balance"] = round(capital, 2)
+                    trades_log.append(current_trade)
+                    current_trade = None
+                
+                position = None
+                units = 0
+            else:
+                status = f"HOLD LONG | Stop: Rs.{stop_loss:.2f}"
+                
+        # --- ENTRY SIGNAL EVALUATION (Flat) ---
+        else:
+            vol_avg = sum(volumes[-20:]) / 20.0
+            # MACD Bullish + RSI Filter + Volume Confirmation
+            if macd > signal and (42.0 <= rsi <= 68.0) and vol > vol_avg:
+                position = "LONG"
+                units = req_units
+                entry_price = close_p
+                highest_price = high_p
+                stop_loss = close_p - stop_dist
+                status = f"BUY {units} Units @ Rs.{close_p:.2f}"
+                
+                # Start new trade record
+                current_trade = {
+                    "trade_id": len(trades_log) + 1,
+                    "entry_bar": idx,
+                    "entry_time": candle_time_str,
+                    "entry_price": round(entry_price, 2),
+                    "units": units,
+                    "regime": regime,
+                    "risk_engine": engine_name,
+                    "exit_bar": None,
+                    "exit_time": None,
+                    "exit_price": None,
+                    "exit_reason": None,
+                    "pnl": 0.0,
+                    "pnl_pct": 0.0,
+                    "balance": round(capital, 2)
+                }
+            else:
+                status = "NO SIGNAL"
+
+        print(f"{idx:03d}   | {candle_time_str:<19} | Rs.{close_p:<7.2f} | {regime:<15} | {engine_name[:30]:<32} | {status}")
+
+    # Mark-to-market close if still in position on the last candle
+    if position == "LONG" and current_trade:
+        final_price = closes[-1]
+        pnl = (final_price - entry_price) * units
+        capital += pnl
+        pnl_pct = ((final_price - entry_price) / entry_price) * 100.0
+        current_trade["exit_bar"] = len(candles) - 1
+        current_trade["exit_time"] = format_candle_time(candles[-1][0])
+        current_trade["exit_price"] = round(final_price, 2)
+        current_trade["exit_reason"] = "BACKTEST_END_CLOSE"
+        current_trade["pnl"] = round(pnl, 2)
+        current_trade["pnl_pct"] = round(pnl_pct, 2)
+        current_trade["balance"] = round(capital, 2)
+        trades_log.append(current_trade)
+
+    print("=" * 95)
+    
+    # Save trades locally
+    save_trades_to_csv(trades_log, output_path=output_csv)
+    
+    # Print Backtest Performance Summary
+    total_trades = len(trades_log)
+    winning_trades = [t for t in trades_log if t["pnl"] > 0]
+    losing_trades = [t for t in trades_log if t["pnl"] < 0]
+    win_rate = (len(winning_trades) / total_trades * 100) if total_trades > 0 else 0.0
+    total_profit = sum(t["pnl"] for t in winning_trades)
+    total_loss = abs(sum(t["pnl"] for t in losing_trades))
+    profit_factor = (total_profit / total_loss) if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
+    net_return_pct = ((capital - initial_capital) / initial_capital) * 100.0
+
+    print("\n" + "=" * 50)
+    print("         BACKTEST PERFORMANCE SUMMARY")
+    print("=" * 50)
+    print(f"  Initial Capital     : Rs. {initial_capital:,.2f}")
+    print(f"  Final Capital       : Rs. {capital:,.2f}")
+    print(f"  Net PnL             : Rs. {capital - initial_capital:+,.2f} ({net_return_pct:+.2f}%)")
+    print(f"  Total Trades        : {total_trades}")
+    print(f"  Winning Trades      : {len(winning_trades)}")
+    print(f"  Losing Trades       : {len(losing_trades)}")
+    print(f"  Win Rate            : {win_rate:.2f}%")
+    print(f"  Profit Factor       : {profit_factor:.2f}")
+    print(f"  Trade Data File     : {output_csv}")
+    print("=" * 50 + "\n")
+
+    return trades_log
+
+if __name__ == "__main__":
+    # --- FYERS API CONFIGURATION ---
+    # Set your credentials here, or enter them when prompted.
+    # App ID must end with -100 (e.g., "AB12345-100")
+    FYERS_CLIENT_ID = os.getenv("FYERS_CLIENT_ID", "")
+    FYERS_SECRET_KEY = os.getenv("FYERS_SECRET_KEY", "")
+    FYERS_ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN", "")
+
+    # Check local cache if no token is explicitly provided
+    if not FYERS_ACCESS_TOKEN:
+        FYERS_ACCESS_TOKEN = get_cached_access_token()
+
+    # If no credentials exist, ask user interactively
+    if not FYERS_ACCESS_TOKEN and not (FYERS_CLIENT_ID and FYERS_SECRET_KEY):
+        print("\n[!] No active Fyers session found.")
+        print("Choose an option:")
+        print("  1. I have an Access Token (paste token directly)")
+        print("  2. Authenticate using App ID & Secret Key")
+        print("  3. Run with synthetic data (Offline Demo)")
+        opt = input("Choice [1/2/3, Default: 3]: ").strip()
+        
+        if opt == "1":
+            FYERS_CLIENT_ID = input("Enter Fyers App ID (e.g. XC12345-100): ").strip()
+            FYERS_ACCESS_TOKEN = input("Enter Access Token: ").strip()
+            if FYERS_ACCESS_TOKEN:
+                with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+                    f.write(FYERS_ACCESS_TOKEN)
+        elif opt == "2":
+            FYERS_CLIENT_ID = input("Enter Fyers App ID (e.g. XC12345-100): ").strip()
+            FYERS_SECRET_KEY = input("Enter Fyers Secret Key: ").strip()
+            if FYERS_CLIENT_ID and FYERS_SECRET_KEY:
+                try:
+                    FYERS_ACCESS_TOKEN = authenticate_fyers(FYERS_CLIENT_ID, FYERS_SECRET_KEY)
+                except Exception as e:
+                    print(f"[-] Authentication failed: {e}")
+                    FYERS_ACCESS_TOKEN = None
+
+    # Run Backtest
+    run_fyers_backtest(
+        client_id=FYERS_CLIENT_ID,
+        access_token=FYERS_ACCESS_TOKEN,
+        symbol="NSE:SBIN-EQ",
+        resolution="15",
+        days_back=30,
+        output_csv="trades_data.csv"
+    )
